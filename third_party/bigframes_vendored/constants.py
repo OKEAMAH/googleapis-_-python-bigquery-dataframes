@@ -12,26 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import typing
+"""Constants used across BigQuery DataFrames and bigframes_vendored.
 
-import bigframes.operations._matplotlib.core as core
-import bigframes.operations._matplotlib.hist as hist
+This module should not depend on any others in the package.
+"""
 
-PLOT_TYPES = typing.Union[type[core.SamplingPlot], type[hist.HistPlot]]
+FEEDBACK_LINK = (
+    "Share your usecase with the BigQuery DataFrames team at the "
+    "https://bit.ly/bigframes-feedback survey."
+)
 
-PLOT_CLASSES: dict[str, PLOT_TYPES] = {
-    "hist": hist.HistPlot,
-    "line": core.LinePlot,
-    "area": core.AreaPlot,
-    "scatter": core.ScatterPlot,
-}
-
-
-def plot(data, kind, **kwargs):
-    plot_obj = PLOT_CLASSES[kind](data, **kwargs)
-    plot_obj.generate()
-    plot_obj.draw()
-    return plot_obj.result
-
-
-__all__ = ["plot"]
+ABSTRACT_METHOD_ERROR_MESSAGE = (
+    "Abstract method. You have likely encountered a bug. "
+    "Please share this stacktrace and how you reached it with the BigQuery DataFrames team. "
+    f"{FEEDBACK_LINK}"
+)
