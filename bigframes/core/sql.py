@@ -19,12 +19,9 @@ Utility functions for SQL construction.
 
 import datetime
 import math
-import textwrap
-from typing import Iterable, TYPE_CHECKING
+from typing import Iterable, Mapping, TYPE_CHECKING, Union
 
-# Literals and identifiers matching this pattern can be unquoted
-unquoted = r"^[A-Za-z_][A-Za-z_0-9]*$"
-
+import bigframes.core.compile.googlesql as googlesql
 
 if TYPE_CHECKING:
     import google.cloud.bigquery as bigquery
@@ -38,7 +35,7 @@ def simple_literal(value: str | int | bool | float | datetime.datetime):
     # https://cloud.google.com/bigquery/docs/reference/standard-sql/lexical#literals
     if isinstance(value, str):
         # Single quoting seems to work nicer with ibis than double quoting
-        return f"'{escape_special_characters(value)}'"
+        return f"'{googlesql._escape_chars(value)}'"
     elif isinstance(value, (bool, int)):
         return str(value)
     elif isinstance(value, float):
@@ -61,39 +58,18 @@ def multi_literal(*values: str):
     return "(" + ", ".join(literal_strings) + ")"
 
 
-def identifier(id: str) -> str:
-    """Return a string representing column reference in a SQL."""
-    # https://cloud.google.com/bigquery/docs/reference/standard-sql/lexical#identifiers
-    # Just always escape, otherwise need to check against every reserved sql keyword
-    return f"`{escape_special_characters(id)}`"
-
-
-def escape_special_characters(value: str):
-    """Escapes all special charactesrs"""
-    # https://cloud.google.com/bigquery/docs/reference/standard-sql/lexical#string_and_bytes_literals
-    trans_table = str.maketrans(
-        {
-            "\a": r"\a",
-            "\b": r"\b",
-            "\f": r"\f",
-            "\n": r"\n",
-            "\r": r"\r",
-            "\t": r"\t",
-            "\v": r"\v",
-            "\\": r"\\",
-            "?": r"\?",
-            '"': r"\"",
-            "'": r"\'",
-            "`": r"\`",
-        }
-    )
-    return value.translate(trans_table)
-
-
 def cast_as_string(column_name: str) -> str:
     """Return a string representing string casting of a column."""
 
-    return f"CAST({identifier(column_name)} AS STRING)"
+    return googlesql.Cast(
+        googlesql.ColumnExpression(column_name), googlesql.DataType.STRING
+    ).sql()
+
+
+def to_json_string(column_name: str) -> str:
+    """Return a string representing JSON version of a column."""
+
+    return f"TO_JSON_STRING({googlesql.identifier(column_name)})"
 
 
 def csv(values: Iterable[str]) -> str:
@@ -101,46 +77,17 @@ def csv(values: Iterable[str]) -> str:
     return ", ".join(values)
 
 
-def table_reference(table_ref: bigquery.TableReference) -> str:
-    return f"`{escape_special_characters(table_ref.project)}`.`{escape_special_characters(table_ref.dataset_id)}`.`{escape_special_characters(table_ref.table_id)}`"
-
-
 def infix_op(opname: str, left_arg: str, right_arg: str):
     # Maybe should add parentheses??
     return f"{left_arg} {opname} {right_arg}"
 
 
-### Writing SELECT expressions
-def select_from_subquery(columns: Iterable[str], subquery: str, distinct: bool = False):
-    selection = ", ".join(map(identifier, columns))
-    distinct_clause = "DISTINCT " if distinct else ""
-
-    return textwrap.dedent(
-        f"SELECT {distinct_clause}{selection}\nFROM (\n" f"{subquery}\n" ")\n"
-    )
-
-
-def select_from_table_ref(
-    columns: Iterable[str], table_ref: bigquery.TableReference, distinct: bool = False
-):
-    selection = ", ".join(map(identifier, columns))
-    distinct_clause = "DISTINCT " if distinct else ""
-
-    return textwrap.dedent(
-        f"SELECT {distinct_clause}{selection}\nFROM {table_reference(table_ref)}"
-    )
-
-
-def select_table(table_ref: bigquery.TableReference):
-    return textwrap.dedent(f"SELECT * FROM {table_reference(table_ref)}")
-
-
 def is_distinct_sql(columns: Iterable[str], table_ref: bigquery.TableReference) -> str:
     is_unique_sql = f"""WITH full_table AS (
-        {select_from_table_ref(columns, table_ref)}
+        {googlesql.Select().from_(table_ref).select(columns).sql()}
     ),
     distinct_table AS (
-        {select_from_table_ref(columns, table_ref, distinct=True)}
+        {googlesql.Select().from_(table_ref).select(columns, distinct=True).sql()}
     )
 
     SELECT (SELECT COUNT(*) FROM full_table) AS `total_count`,
@@ -169,3 +116,47 @@ def ordering_clause(
         part = f"`{ordering_expr.id}` {asc_desc} {null_clause}"
         parts.append(part)
     return f"ORDER BY {' ,'.join(parts)}"
+
+
+def create_vector_search_sql(
+    sql_string: str,
+    options: Mapping[str, Union[str | int | bool | float]] = {},
+) -> str:
+    """Encode the VECTOR SEARCH statement for BigQuery Vector Search."""
+
+    base_table = options["base_table"]
+    column_to_search = options["column_to_search"]
+    distance_type = options["distance_type"]
+    top_k = options["top_k"]
+    query_column_to_search = options.get("query_column_to_search", None)
+
+    if query_column_to_search is not None:
+        query_str = f"""
+    SELECT
+        query.*,
+        base.*,
+        distance,
+    FROM VECTOR_SEARCH(
+        TABLE `{base_table}`,
+        {simple_literal(column_to_search)},
+        ({sql_string}),
+        {simple_literal(query_column_to_search)},
+        distance_type => {simple_literal(distance_type)},
+        top_k => {simple_literal(top_k)}
+    )
+    """
+    else:
+        query_str = f"""
+    SELECT
+        query.*,
+        base.*,
+        distance,
+    FROM VECTOR_SEARCH(
+        TABLE `{base_table}`,
+        {simple_literal(column_to_search)},
+        ({sql_string}),
+        distance_type => {simple_literal(distance_type)},
+        top_k => {simple_literal(top_k)}
+    )
+    """
+    return query_str

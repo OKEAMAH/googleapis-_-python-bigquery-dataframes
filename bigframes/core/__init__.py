@@ -23,12 +23,11 @@ from typing import Iterable, Optional, Sequence
 import warnings
 
 import google.cloud.bigquery
-import ibis.expr.types as ibis_types
 import pandas
 import pyarrow as pa
 import pyarrow.feather as pa_feather
 
-import bigframes.core.compile as compiling
+import bigframes.core.compile
 import bigframes.core.expression as ex
 import bigframes.core.guid
 import bigframes.core.join_def as join_def
@@ -61,27 +60,6 @@ class ArrayValue:
     node: nodes.BigFrameNode
 
     @classmethod
-    def from_ibis(
-        cls,
-        session: Session,
-        table: ibis_types.Table,
-        columns: Sequence[ibis_types.Value],
-        hidden_ordering_columns: Sequence[ibis_types.Value],
-        ordering: orderings.ExpressionOrdering,
-    ):
-        node = nodes.ReadGbqNode(
-            table=table,
-            table_session=session,
-            columns=tuple(
-                bigframes.dtypes.ibis_value_to_canonical_type(column)
-                for column in columns
-            ),
-            hidden_ordering_columns=tuple(hidden_ordering_columns),
-            ordering=ordering,
-        )
-        return cls(node)
-
-    @classmethod
     def from_pyarrow(cls, arrow_table: pa.Table, session: Session):
         adapted_table = local_data.adapt_pa_table(arrow_table)
         schema = local_data.arrow_schema_to_bigframes(adapted_table.schema)
@@ -96,6 +74,23 @@ class ArrayValue:
         return cls(node)
 
     @classmethod
+    def from_cached(
+        cls,
+        original: ArrayValue,
+        table: google.cloud.bigquery.Table,
+        ordering: orderings.ExpressionOrdering,
+    ):
+        node = nodes.CachedTableNode(
+            original_node=original.node,
+            project_id=table.reference.project,
+            dataset_id=table.reference.dataset_id,
+            table_id=table.reference.table_id,
+            physical_schema=tuple(table.schema),
+            ordering=ordering,
+        )
+        return cls(node)
+
+    @classmethod
     def from_table(
         cls,
         table: google.cloud.bigquery.Table,
@@ -105,7 +100,10 @@ class ArrayValue:
         predicate: Optional[str] = None,
         at_time: Optional[datetime.datetime] = None,
         primary_key: Sequence[str] = (),
+        offsets_col: Optional[str] = None,
     ):
+        if offsets_col and primary_key:
+            raise ValueError("must set at most one of 'offests', 'primary_key'")
         if any(i.field_type == "JSON" for i in table.schema if i.name in schema.names):
             warnings.warn(
                 "Interpreting JSON column(s) as StringDtype. This behavior may change in future versions.",
@@ -116,7 +114,8 @@ class ArrayValue:
             dataset_id=table.reference.dataset_id,
             table_id=table.reference.table_id,
             physical_schema=tuple(table.schema),
-            total_order_cols=tuple(primary_key),
+            total_order_cols=(offsets_col,) if offsets_col else tuple(primary_key),
+            order_col_is_sequential=(offsets_col is not None),
             columns=schema,
             at_time=at_time,
             table_session=session,
@@ -143,29 +142,32 @@ class ArrayValue:
 
     @functools.cached_property
     def _compiled_schema(self) -> schemata.ArraySchema:
-        compiled = self._compile_unordered()
-        items = tuple(
-            schemata.SchemaItem(id, compiled.get_column_type(id))
-            for id in compiled.column_ids
+        return bigframes.core.compile.test_only_ibis_inferred_schema(self.node)
+
+    def as_cached(
+        self: ArrayValue,
+        cache_table: google.cloud.bigquery.Table,
+        ordering: Optional[orderings.ExpressionOrdering],
+    ) -> ArrayValue:
+        """
+        Replace the node with an equivalent one that references a tabel where the value has been materialized to.
+        """
+        node = nodes.CachedTableNode(
+            original_node=self.node,
+            project_id=cache_table.reference.project,
+            dataset_id=cache_table.reference.dataset_id,
+            table_id=cache_table.reference.table_id,
+            physical_schema=tuple(cache_table.schema),
+            ordering=ordering,
         )
-        return schemata.ArraySchema(items)
+        return ArrayValue(node)
 
     def _try_evaluate_local(self):
         """Use only for unit testing paths - not fully featured. Will throw exception if fails."""
-        import ibis
-
-        return ibis.pandas.connect({}).execute(
-            self._compile_ordered()._to_ibis_expr(ordering_mode="unordered")
-        )
+        return bigframes.core.compile.test_only_try_evaluate(self.node)
 
     def get_column_type(self, key: str) -> bigframes.dtypes.Dtype:
         return self.schema.get_type(key)
-
-    def _compile_ordered(self) -> compiling.OrderedIR:
-        return compiling.compile_ordered_ir(self.node)
-
-    def _compile_unordered(self) -> compiling.UnorderedIR:
-        return compiling.compile_unordered_ir(self.node)
 
     def row_count(self) -> ArrayValue:
         """Get number of rows in ArrayValue as a single-entry ArrayValue."""
@@ -192,6 +194,8 @@ class ArrayValue:
         """
         Convenience function to promote copy of column offsets to a value column. Can be used to reset index.
         """
+        if not self.session._strictly_ordered:
+            raise ValueError("Generating offsets not supported in unordered mode")
         return ArrayValue(nodes.PromoteOffsetsNode(child=self.node, col_id=col_id))
 
     def concat(self, other: typing.Sequence[ArrayValue]) -> ArrayValue:
@@ -340,6 +344,10 @@ class ArrayValue:
         never_skip_nulls: will disable null skipping for operators that would otherwise do so
         skip_reproject_unsafe: skips the reprojection step, can be used when performing many non-dependent window operations, user responsible for not nesting window expressions, or using outputs as join, filter or aggregation keys before a reprojection
         """
+        if not self.session._strictly_ordered:
+            # TODO: Support unbounded windows with aggregate ops and some row-order-independent analytic ops
+            # TODO: Support non-deterministic windowing
+            raise ValueError("Windowed ops not supported in unordered mode")
         return ArrayValue(
             nodes.WindowOpNode(
                 child=self.node,
@@ -391,8 +399,9 @@ class ArrayValue:
         """
         # There will be N labels, used to disambiguate which of N source columns produced each output row
         explode_offsets_id = bigframes.core.guid.generate_guid("unpivot_offsets_")
-        labels_array = self._create_unpivot_labels_array(row_labels, index_col_ids)
-        labels_array = labels_array.promote_offsets(explode_offsets_id)
+        labels_array = self._create_unpivot_labels_array(
+            row_labels, index_col_ids, explode_offsets_id
+        )
 
         # Unpivot creates N output rows for each input row, labels disambiguate these N rows
         joined_array = self._cross_join_w_labels(labels_array, join_side)
@@ -458,6 +467,7 @@ class ArrayValue:
         self,
         former_column_labels: typing.Sequence[typing.Hashable],
         col_ids: typing.Sequence[str],
+        offsets_id: str,
     ) -> ArrayValue:
         """Create an ArrayValue from a list of label tuples."""
         rows = []
@@ -468,6 +478,7 @@ class ArrayValue:
                 col_ids[i]: (row_label[i] if pandas.notnull(row_label[i]) else None)
                 for i in range(len(col_ids))
             }
+            row[offsets_id] = row_offset
             rows.append(row)
 
         return ArrayValue.from_pyarrow(pa.Table.from_pylist(rows), session=self.session)
@@ -494,11 +505,11 @@ class ArrayValue:
         join_type: join_def.JoinType,
         mappings: typing.Tuple[join_def.JoinColumnMapping, ...],
     ) -> typing.Optional[ArrayValue]:
-        left_side = bigframes.core.rewrite.SquashedSelect.from_node(self.node)
-        right_side = bigframes.core.rewrite.SquashedSelect.from_node(other.node)
-        result = left_side.maybe_merge(right_side, join_type, mappings)
+        result = bigframes.core.rewrite.join_as_projection(
+            self.node, other.node, mappings, join_type
+        )
         if result is not None:
-            return ArrayValue(result.expand())
+            return ArrayValue(result)
         return None
 
     def explode(self, column_ids: typing.Sequence[str]) -> ArrayValue:
@@ -517,7 +528,3 @@ class ArrayValue:
             The row numbers of result is non-deterministic, avoid to use.
         """
         return ArrayValue(nodes.RandomSampleNode(self.node, fraction))
-
-    def merge_projections(self) -> ArrayValue:
-        new_node = bigframes.core.rewrite.maybe_squash_projection(self.node)
-        return ArrayValue(new_node)

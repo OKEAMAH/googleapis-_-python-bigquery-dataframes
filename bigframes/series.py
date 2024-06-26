@@ -281,6 +281,11 @@ class Series(bigframes.operations.base.SeriesMethods, vendored_pandas_series.Ser
             return bigframes.dataframe.DataFrame(block)
 
     def __repr__(self) -> str:
+        # Protect against errors with uninitialized Series. See:
+        # https://github.com/googleapis/python-bigquery-dataframes/issues/728
+        if not hasattr(self, "_block"):
+            return object.__repr__(self)
+
         # TODO(swast): Add a timeout here? If the query is taking a long time,
         # maybe we just print the job metadata that we have so far?
         # TODO(swast): Avoid downloading the whole series by using job
@@ -318,7 +323,7 @@ class Series(bigframes.operations.base.SeriesMethods, vendored_pandas_series.Ser
         sampling_method: Optional[str] = None,
         random_state: Optional[int] = None,
         *,
-        ordered: bool = True,
+        ordered: Optional[bool] = None,
     ) -> pandas.Series:
         """Writes Series to pandas Series.
 
@@ -338,9 +343,10 @@ class Series(bigframes.operations.base.SeriesMethods, vendored_pandas_series.Ser
                 The seed for the uniform downsampling algorithm. If provided, the uniform method may
                 take longer to execute and require more computation. If set to a value other than
                 None, this will supersede the global config.
-            ordered (bool, default True):
+            ordered (bool, default None):
                 Determines whether the resulting pandas series will be deterministically ordered.
-                In some cases, unordered may result in a faster-executing query.
+                In some cases, unordered may result in a faster-executing query. If set to a value
+                other than None, will override Session default.
 
 
         Returns:
@@ -352,7 +358,7 @@ class Series(bigframes.operations.base.SeriesMethods, vendored_pandas_series.Ser
             max_download_size=max_download_size,
             sampling_method=sampling_method,
             random_state=random_state,
-            ordered=ordered,
+            ordered=ordered if ordered is not None else self._session._strictly_ordered,
         )
         self._set_internal_query_job(query_job)
         series = df.squeeze(axis=1)
@@ -783,10 +789,10 @@ class Series(bigframes.operations.base.SeriesMethods, vendored_pandas_series.Ser
     def rpow(self, other: float | int | Series) -> Series:
         return self._apply_binary_op(other, ops.pow_op, reverse=True)
 
-    def __lt__(self, other: float | int | Series) -> Series:  # type: ignore
+    def __lt__(self, other: float | int | str | Series) -> Series:
         return self.lt(other)
 
-    def __le__(self, other: float | int | Series) -> Series:  # type: ignore
+    def __le__(self, other: float | int | str | Series) -> Series:
         return self.le(other)
 
     def lt(self, other) -> Series:
@@ -795,10 +801,10 @@ class Series(bigframes.operations.base.SeriesMethods, vendored_pandas_series.Ser
     def le(self, other) -> Series:
         return self._apply_binary_op(other, ops.le_op)
 
-    def __gt__(self, other: float | int | Series) -> Series:  # type: ignore
+    def __gt__(self, other: float | int | str | Series) -> Series:
         return self.gt(other)
 
-    def __ge__(self, other: float | int | Series) -> Series:  # type: ignore
+    def __ge__(self, other: float | int | str | Series) -> Series:
         return self.ge(other)
 
     def gt(self, other) -> Series:

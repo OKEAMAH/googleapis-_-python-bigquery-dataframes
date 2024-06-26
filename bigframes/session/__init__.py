@@ -64,7 +64,6 @@ import google.cloud.resourcemanager_v3
 import google.cloud.storage as storage  # type: ignore
 import ibis
 import ibis.backends.bigquery as ibis_bigquery
-import ibis.expr.types as ibis_types
 import jellyfish
 import numpy as np
 import pandas
@@ -84,7 +83,6 @@ import bigframes.core.blocks as blocks
 import bigframes.core.compile
 import bigframes.core.guid
 import bigframes.core.nodes as nodes
-from bigframes.core.ordering import IntegerEncoding
 import bigframes.core.ordering as order
 import bigframes.core.schema as schemata
 import bigframes.core.tree_properties as traversals
@@ -249,6 +247,8 @@ class Session(
         # the ibis client has been created
         original_default_query_job_config = self.bqclient.default_query_job_config
 
+        # Only used to fetch remote function metadata.
+        # TODO: Remove in favor of raw bq client
         self.ibis_client = typing.cast(
             ibis_bigquery.Backend,
             ibis.bigquery.connect(
@@ -295,6 +295,15 @@ class Session(
         self._bytes_processed_sum = 0
         self._slot_millis_sum = 0
         self._execution_count = 0
+        # Whether this session treats objects as totally ordered.
+        # Will expose as feature later, only False for internal testing
+        self._strictly_ordered: bool = context._strictly_ordered
+        # Sequential index needs total ordering to generate, so use null index with unstrict ordering.
+        self._default_index_type: bigframes.enums.DefaultIndexKind = (
+            bigframes.enums.DefaultIndexKind.SEQUENTIAL_INT64
+            if context._strictly_ordered
+            else bigframes.enums.DefaultIndexKind.NULL
+        )
 
     @property
     def bqclient(self):
@@ -879,11 +888,11 @@ class Session(
         # Create Default Sequential Index if still have no index
         # ----------------------------------------------------
 
-        # If no index columns provided or found, fall back to sequential index
+        # If no index columns provided or found, fall back to session default
         if (index_col != bigframes.enums.DefaultIndexKind.NULL) and len(
             index_cols
         ) == 0:
-            index_col = bigframes.enums.DefaultIndexKind.SEQUENTIAL_INT64
+            index_col = self._default_index_type
 
         index_names: Sequence[Hashable] = index_cols
         if index_col == bigframes.enums.DefaultIndexKind.SEQUENTIAL_INT64:
@@ -1159,35 +1168,14 @@ class Session(
         )
         self._start_generic_job(load_job)
 
-        ordering = order.ExpressionOrdering(
-            ordering_value_columns=tuple([order.ascending_over(ordering_col)]),
-            total_ordering_columns=frozenset([ordering_col]),
-            integer_encoding=IntegerEncoding(True, is_sequential=True),
-        )
-        table_expression = self.ibis_client.table(  # type: ignore
-            load_table_destination.table_id,
-            schema=load_table_destination.dataset_id,
-            database=load_table_destination.project,
-        )
-
-        # b/297590178 Potentially a bug in bqclient.load_table_from_dataframe(), that only when the DF is empty, the index columns disappear in table_expression.
-        if any(
-            [new_idx_id not in table_expression.columns for new_idx_id in new_idx_ids]
-        ):
-            new_idx_ids, idx_labels = [], []
-
-        column_values = [
-            table_expression[col]
-            for col in table_expression.columns
-            if col != ordering_col
-        ]
-        array_value = core.ArrayValue.from_ibis(
-            self,
-            table_expression,
-            columns=column_values,
-            hidden_ordering_columns=[table_expression[ordering_col]],
-            ordering=ordering,
-        )
+        destination_table = self.bqclient.get_table(load_table_destination)
+        array_value = core.ArrayValue.from_table(
+            table=destination_table,
+            # TODO: Generate this directly from original pandas df.
+            schema=schemata.ArraySchema.from_bq_table(destination_table),
+            session=self,
+            offsets_col=ordering_col,
+        ).drop_columns([ordering_col])
 
         block = blocks.Block(
             array_value,
@@ -1516,14 +1504,14 @@ class Session(
         )
         return bigquery.TableReference.from_string(table)
 
-    def _ibis_to_temp_table(
+    def _sql_to_temp_table(
         self,
-        table: ibis_types.Table,
+        sql: str,
         cluster_cols: Iterable[str],
         api_name: str,
     ) -> bigquery.TableReference:
         destination, _ = self._query_to_destination(
-            self.ibis_client.compile(table),
+            sql,
             index_cols=list(cluster_cols),
             api_name=api_name,
         )
@@ -1863,30 +1851,18 @@ class Session(
         """Executes the query and uses the resulting table to rewrite future executions."""
         # TODO: Use this for all executions? Problem is that caching materializes extra
         # ordering columns
-        compiled_value = self._compile_ordered(array_value)
+        # TODO: May want to support some partial ordering info even for non-strict ordering mode
+        keep_order_info = self._strictly_ordered
 
-        ibis_expr = compiled_value._to_ibis_expr(
-            ordering_mode="unordered", expose_hidden_cols=True
+        sql, ordering_info = bigframes.core.compile.compile_raw(
+            self._with_cached_executions(array_value.node)
         )
-        tmp_table = self._ibis_to_temp_table(
-            ibis_expr, cluster_cols=cluster_cols, api_name="cached"
+        tmp_table = self._sql_to_temp_table(
+            sql, cluster_cols=cluster_cols, api_name="cached"
         )
-        table_expression = self.ibis_client.table(
-            tmp_table.table_id,
-            schema=tmp_table.dataset_id,
-            database=tmp_table.project,
-        )
-        new_columns = [table_expression[column] for column in compiled_value.column_ids]
-        new_hidden_columns = [
-            table_expression[column]
-            for column in compiled_value._hidden_ordering_column_names
-        ]
-        cached_replacement = core.ArrayValue.from_ibis(
-            self,
-            table_expression,
-            columns=new_columns,
-            hidden_ordering_columns=new_hidden_columns,
-            ordering=compiled_value._ordering,
+        cached_replacement = array_value.as_cached(
+            cache_table=self.bqclient.get_table(tmp_table),
+            ordering=ordering_info if keep_order_info else None,
         ).node
         self._cached_executions[array_value.node] = cached_replacement
 
@@ -1894,26 +1870,21 @@ class Session(
         """Executes the query and uses the resulting table to rewrite future executions."""
         # TODO: Use this for all executions? Problem is that caching materializes extra
         # ordering columns
-        compiled_value = self._compile_ordered(array_value)
+        if not self._strictly_ordered:
+            raise ValueError(
+                "Caching with offsets only supported in strictly ordered mode."
+            )
+        sql = bigframes.core.compile.compile_unordered(
+            self._with_cached_executions(
+                array_value.promote_offsets("bigframes_offsets").node
+            )
+        )
 
-        ibis_expr = compiled_value._to_ibis_expr(
-            ordering_mode="offset_col", order_col_name="bigframes_offsets"
+        tmp_table = self._sql_to_temp_table(
+            sql, cluster_cols=["bigframes_offsets"], api_name="cached"
         )
-        tmp_table = self._ibis_to_temp_table(
-            ibis_expr, cluster_cols=["bigframes_offsets"], api_name="cached"
-        )
-        table_expression = self.ibis_client.table(
-            tmp_table.table_id,
-            schema=tmp_table.dataset_id,
-            database=tmp_table.project,
-        )
-        new_columns = [table_expression[column] for column in compiled_value.column_ids]
-        new_hidden_columns = [table_expression["bigframes_offsets"]]
-        cached_replacement = core.ArrayValue.from_ibis(
-            self,
-            table_expression,
-            columns=new_columns,
-            hidden_ordering_columns=new_hidden_columns,
+        cached_replacement = array_value.as_cached(
+            cache_table=self.bqclient.get_table(tmp_table),
             ordering=order.ExpressionOrdering.from_offset_col("bigframes_offsets"),
         ).node
         self._cached_executions[array_value.node] = cached_replacement
@@ -1970,14 +1941,14 @@ class Session(
         array_value: core.ArrayValue,
         job_config: Optional[bigquery.job.QueryJobConfig] = None,
         *,
-        sorted: bool = True,
+        ordered: bool = True,
         dry_run=False,
         col_id_overrides: Mapping[str, str] = {},
     ) -> tuple[bigquery.table.RowIterator, bigquery.QueryJob]:
         if not dry_run:
             self._add_execution(1)
         sql = self._to_sql(
-            array_value, sorted=sorted, col_id_overrides=col_id_overrides
+            array_value, ordered=ordered, col_id_overrides=col_id_overrides
         )  # type:ignore
         if job_config is None:
             job_config = bigquery.QueryJobConfig(dry_run=dry_run)
@@ -1997,7 +1968,9 @@ class Session(
         """A 'peek' efficiently accesses a small number of rows in the dataframe."""
         if not tree_properties.peekable(self._with_cached_executions(array_value.node)):
             warnings.warn("Peeking this value cannot be done efficiently.")
-        sql = self._compile_unordered(array_value).peek_sql(n_rows)
+        sql = bigframes.core.compile.compile_peek(
+            self._with_cached_executions(array_value.node), n_rows
+        )
 
         # TODO(swast): plumb through the api_name of the user-facing api that
         # caused this query.
@@ -2010,30 +1983,17 @@ class Session(
         array_value: core.ArrayValue,
         offset_column: typing.Optional[str] = None,
         col_id_overrides: typing.Mapping[str, str] = {},
-        sorted: bool = False,
+        ordered: bool = False,
     ) -> str:
         if offset_column:
             array_value = array_value.promote_offsets(offset_column)
-        if sorted:
-            return self._compile_ordered(array_value).to_sql(
-                col_id_overrides=col_id_overrides, sorted=True
+        node_w_cached = self._with_cached_executions(array_value.node)
+        if ordered:
+            return bigframes.core.compile.compile_ordered(
+                node_w_cached, col_id_overrides=col_id_overrides
             )
-        return self._compile_unordered(array_value).to_sql(
-            col_id_overrides=col_id_overrides
-        )
-
-    def _compile_ordered(
-        self, array_value: core.ArrayValue
-    ) -> bigframes.core.compile.OrderedIR:
-        return bigframes.core.compile.compile_ordered_ir(
-            self._with_cached_executions(array_value.node)
-        )
-
-    def _compile_unordered(
-        self, array_value: core.ArrayValue
-    ) -> bigframes.core.compile.UnorderedIR:
-        return bigframes.core.compile.compile_unordered_ir(
-            self._with_cached_executions(array_value.node)
+        return bigframes.core.compile.compile_unordered(
+            node_w_cached, col_id_overrides=col_id_overrides
         )
 
     def _get_table_size(self, destination_table):

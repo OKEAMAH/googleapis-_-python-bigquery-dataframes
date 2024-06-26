@@ -28,6 +28,8 @@ import ibis.expr.types as ibis_types
 import pandas
 
 import bigframes.core.compile.aggregate_compiler as agg_compiler
+import bigframes.core.compile.googlesql
+import bigframes.core.compile.ibis_types
 import bigframes.core.compile.scalar_op_compiler as op_compilers
 import bigframes.core.expression as ex
 import bigframes.core.guid
@@ -157,16 +159,19 @@ class BaseIbisIR(abc.ABC):
             )
         return typing.cast(
             ibis_types.Value,
-            bigframes.dtypes.ibis_value_to_canonical_type(self._column_names[key]),
+            bigframes.core.compile.ibis_types.ibis_value_to_canonical_type(
+                self._column_names[key]
+            ),
         )
 
     def get_column_type(self, key: str) -> bigframes.dtypes.Dtype:
         ibis_type = typing.cast(
-            bigframes.dtypes.IbisDtype, self._get_ibis_column(key).type()
+            bigframes.core.compile.ibis_types.IbisDtype,
+            self._get_ibis_column(key).type(),
         )
         return typing.cast(
             bigframes.dtypes.Dtype,
-            bigframes.dtypes.ibis_dtype_to_bigframes_dtype(ibis_type),
+            bigframes.core.compile.ibis_types.ibis_dtype_to_bigframes_dtype(ibis_type),
         )
 
     def _aggregate_base(
@@ -253,9 +258,9 @@ class UnorderedIR(BaseIbisIR):
         self,
         offset_column: typing.Optional[str] = None,
         col_id_overrides: typing.Mapping[str, str] = {},
-        sorted: bool = False,
+        ordered: bool = False,
     ) -> str:
-        if offset_column or sorted:
+        if offset_column or ordered:
             raise ValueError("Cannot produce sorted sql in unordered mode")
         sql = ibis_bigquery.Backend().compile(
             self._to_ibis_expr(
@@ -332,7 +337,8 @@ class UnorderedIR(BaseIbisIR):
         # Make sure all dtypes are the "canonical" ones for BigFrames. This is
         # important for operations like UNION where the schema must match.
         table = self._table.select(
-            bigframes.dtypes.ibis_value_to_canonical_type(column) for column in columns
+            bigframes.core.compile.ibis_types.ibis_value_to_canonical_type(column)
+            for column in columns
         )
         base_table = table
         if self._reduced_predicate is not None:
@@ -579,7 +585,10 @@ class OrderedIR(BaseIbisIR):
         ibis_values = ibis_values.assign(**{ORDER_ID_COLUMN: range(len(pd_df))})
         # derive the ibis schema from the original pandas schema
         ibis_schema = [
-            (name, bigframes.dtypes.bigframes_dtype_to_ibis_dtype(dtype))
+            (
+                name,
+                bigframes.core.compile.ibis_types.bigframes_dtype_to_ibis_dtype(dtype),
+            )
             for name, dtype in zip(schema.names, schema.dtypes)
         ]
         ibis_schema.append((ORDER_ID_COLUMN, ibis_dtypes.int64))
@@ -882,9 +891,9 @@ class OrderedIR(BaseIbisIR):
     def to_sql(
         self,
         col_id_overrides: typing.Mapping[str, str] = {},
-        sorted: bool = False,
+        ordered: bool = False,
     ) -> str:
-        if sorted:
+        if ordered:
             # Need to bake ordering expressions into the selected column in order for our ordering clause builder to work.
             baked_ir = self._bake_ordering()
             sql = ibis_bigquery.Backend().compile(
@@ -897,7 +906,12 @@ class OrderedIR(BaseIbisIR):
             output_columns = [
                 col_id_overrides.get(col, col) for col in baked_ir.column_ids
             ]
-            sql = bigframes.core.sql.select_from_subquery(output_columns, sql)
+            sql = (
+                bigframes.core.compile.googlesql.Select()
+                .from_(sql)
+                .select(output_columns)
+                .sql()
+            )
 
             # Single row frames may not have any ordering columns
             if len(baked_ir._ordering.all_ordering_columns) > 0:
@@ -914,6 +928,15 @@ class OrderedIR(BaseIbisIR):
                 )
             )
         return typing.cast(str, sql)
+
+    def raw_sql(self) -> str:
+        """Return sql with all hidden columns. Used to cache with ordering information."""
+        return ibis_bigquery.Backend().compile(
+            self._to_ibis_expr(
+                ordering_mode="unordered",
+                expose_hidden_cols=True,
+            )
+        )
 
     def _to_ibis_expr(
         self,
@@ -993,7 +1016,9 @@ class OrderedIR(BaseIbisIR):
         # Make sure all dtypes are the "canonical" ones for BigFrames. This is
         # important for operations like UNION where the schema must match.
         table = table.select(
-            bigframes.dtypes.ibis_value_to_canonical_type(table[column])
+            bigframes.core.compile.ibis_types.ibis_value_to_canonical_type(
+                table[column]
+            )
             for column in table.columns
         )
         base_table = table
