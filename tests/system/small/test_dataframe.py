@@ -2485,12 +2485,19 @@ def test_dataframe_agg_single_string(scalars_dfs):
     )
 
 
-def test_dataframe_agg_int_single_string(scalars_dfs):
+@pytest.mark.parametrize(
+    ("agg",),
+    (
+        ("sum",),
+        ("size",),
+    ),
+)
+def test_dataframe_agg_int_single_string(scalars_dfs, agg):
     numeric_cols = ["int64_col", "int64_too", "bool_col"]
     scalars_df, scalars_pandas_df = scalars_dfs
 
-    bf_result = scalars_df[numeric_cols].agg("sum").to_pandas()
-    pd_result = scalars_pandas_df[numeric_cols].agg("sum")
+    bf_result = scalars_df[numeric_cols].agg(agg).to_pandas()
+    pd_result = scalars_pandas_df[numeric_cols].agg(agg)
 
     assert bf_result.dtype == "Int64"
     pd.testing.assert_series_equal(
@@ -2537,6 +2544,7 @@ def test_dataframe_agg_int_multi_string(scalars_dfs):
         "sum",
         "nunique",
         "count",
+        "size",
     ]
     scalars_df, scalars_pandas_df = scalars_dfs
     bf_result = scalars_df[numeric_cols].agg(aggregations).to_pandas()
@@ -4464,13 +4472,26 @@ def test_recursion_limit(scalars_df_index):
     scalars_df_index.to_pandas()
 
 
+def test_query_complexity_error(scalars_df_index):
+    # This test requires automatic caching/query decomposition to be turned off
+    bf_df = scalars_df_index
+    for _ in range(8):
+        bf_df = bf_df.merge(bf_df, on="int64_col").head(30)
+        bf_df = bf_df[bf_df.columns[:20]]
+
+    with pytest.raises(
+        bigframes.exceptions.QueryComplexityError, match=r"Try using DataFrame\.cache"
+    ):
+        bf_df.to_pandas()
+
+
 def test_query_complexity_repeated_joins(
     scalars_df_index, scalars_pandas_df_index, with_multiquery_execution
 ):
     pd_df = scalars_pandas_df_index
     bf_df = scalars_df_index
-    for _ in range(6):
-        # recursively join, resuling in 2^6 - 1 = 63 joins
+    for _ in range(8):
+        # recursively join, resuling in 2^8 - 1 = 255 joins
         pd_df = pd_df.merge(pd_df, on="int64_col").head(30)
         pd_df = pd_df[pd_df.columns[:20]]
         bf_df = bf_df.merge(bf_df, on="int64_col").head(30)

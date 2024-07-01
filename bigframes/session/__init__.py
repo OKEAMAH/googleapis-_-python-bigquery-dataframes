@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import collections.abc
 import copy
 import datetime
 import itertools
@@ -84,6 +83,7 @@ import bigframes.core.compile
 import bigframes.core.guid
 import bigframes.core.nodes as nodes
 import bigframes.core.ordering as order
+import bigframes.core.pruning
 import bigframes.core.schema as schemata
 import bigframes.core.tree_properties as traversals
 import bigframes.core.tree_properties as tree_properties
@@ -100,6 +100,7 @@ from bigframes.functions.remote_function import remote_function as bigframes_rf
 import bigframes.session._io.bigquery as bf_io_bigquery
 import bigframes.session._io.bigquery.read_gbq_table as bf_read_gbq_table
 import bigframes.session.clients
+import bigframes.session.planner
 import bigframes.version
 
 # Avoid circular imports.
@@ -342,13 +343,15 @@ class Session(
     @property
     def objects(
         self,
-    ) -> collections.abc.Set[
+    ) -> Iterable[
         Union[
             bigframes.core.indexes.Index, bigframes.series.Series, dataframe.DataFrame
         ]
     ]:
+        still_alive = [i for i in self._objects if i() is not None]
+        self._objects = still_alive
         # Create a set with strong references, be careful not to hold onto this needlessly, as will prevent garbage collection.
-        return set(i() for i in self._objects if i() is not None)  # type: ignore
+        return tuple(i() for i in self._objects if i() is not None)  # type: ignore
 
     @property
     def _project(self):
@@ -1534,12 +1537,15 @@ class Session(
         cloud_function_timeout: Optional[int] = 600,
         cloud_function_max_instances: Optional[int] = None,
         cloud_function_vpc_connector: Optional[str] = None,
+        cloud_function_memory_mib: Optional[int] = 1024,
     ):
         """Decorator to turn a user defined function into a BigQuery remote function. Check out
         the code samples at: https://cloud.google.com/bigquery/docs/remote-functions#bigquery-dataframes.
 
         .. note::
-            ``input_types=Series`` scenario is in preview.
+            ``input_types=Series`` scenario is in preview. It currently only
+            supports dataframe with column types ``Int64``/``Float64``/``boolean``/
+            ``string``/``binary[pyarrow]``.
 
         .. note::
             Please make sure following is setup before using this API:
@@ -1665,6 +1671,15 @@ class Session(
                 function. This is useful if your code needs access to data or
                 service(s) that are on a VPC network. See for more details
                 https://cloud.google.com/functions/docs/networking/connecting-vpc.
+            cloud_function_memory_mib (int, Optional):
+                The amounts of memory (in mebibytes) to allocate for the cloud
+                function (2nd gen) created. This also dictates a corresponding
+                amount of allocated CPU for the function. By default a memory of
+                1024 MiB is set for the cloud functions created to support
+                BigQuery DataFrames remote function. If you want to let the
+                default memory of cloud functions be allocated, pass `None`. See
+                for more details
+                https://cloud.google.com/functions/docs/configuring/memory.
         Returns:
             callable: A remote function object pointing to the cloud assets created
             in the background to support the remote execution. The cloud assets can be
@@ -1690,6 +1705,7 @@ class Session(
             cloud_function_timeout=cloud_function_timeout,
             cloud_function_max_instances=cloud_function_max_instances,
             cloud_function_vpc_connector=cloud_function_vpc_connector,
+            cloud_function_memory_mib=cloud_function_memory_mib,
         )
 
     def read_gbq_function(
@@ -1817,14 +1833,22 @@ class Session(
         Starts BigQuery query job and waits for results.
         """
         job_config = self._prepare_query_job_config(job_config)
-        return bigframes.session._io.bigquery.start_query_with_client(
-            self,
-            sql,
-            job_config,
-            max_results,
-            timeout,
-            api_name=api_name,
-        )
+        try:
+            return bigframes.session._io.bigquery.start_query_with_client(
+                self,
+                sql,
+                job_config,
+                max_results,
+                timeout,
+                api_name=api_name,
+            )
+        except google.api_core.exceptions.BadRequest as e:
+            # Unfortunately, this error type does not have a separate error code or exception type
+            if "Resources exceeded during query execution" in e.message:
+                new_message = "Computation is too complex to execute as a single query. Try using DataFrame.cache() on intermediate results, or setting bigframes.options.compute.enable_multi_query_execution."
+                raise bigframes.exceptions.QueryComplexityError(new_message) from e
+            else:
+                raise
 
     def _start_query_ml_ddl(
         self,
@@ -1874,20 +1898,33 @@ class Session(
             raise ValueError(
                 "Caching with offsets only supported in strictly ordered mode."
             )
+        offset_column = bigframes.core.guid.generate_guid("bigframes_offsets")
         sql = bigframes.core.compile.compile_unordered(
             self._with_cached_executions(
-                array_value.promote_offsets("bigframes_offsets").node
+                array_value.promote_offsets(offset_column).node
             )
         )
 
         tmp_table = self._sql_to_temp_table(
-            sql, cluster_cols=["bigframes_offsets"], api_name="cached"
+            sql, cluster_cols=[offset_column], api_name="cached"
         )
         cached_replacement = array_value.as_cached(
             cache_table=self.bqclient.get_table(tmp_table),
-            ordering=order.ExpressionOrdering.from_offset_col("bigframes_offsets"),
+            ordering=order.ExpressionOrdering.from_offset_col(offset_column),
         ).node
         self._cached_executions[array_value.node] = cached_replacement
+
+    def _cache_with_session_awareness(self, array_value: core.ArrayValue) -> None:
+        # this is the occurence count across the whole session
+        forest = [obj._block.expr.node for obj in self.objects]
+        # These node types are cheap to re-compute
+        target, cluster_cols = bigframes.session.planner.session_aware_cache_plan(
+            array_value.node, forest
+        )
+        if len(cluster_cols) > 0:
+            self._cache_with_cluster_cols(core.ArrayValue(target), cluster_cols)
+        else:
+            self._cache_with_offsets(core.ArrayValue(target))
 
     def _simplify_with_caching(self, array_value: core.ArrayValue):
         """Attempts to handle the complexity by caching duplicated subtrees and breaking the query into pieces."""
